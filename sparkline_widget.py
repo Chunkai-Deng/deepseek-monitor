@@ -139,4 +139,60 @@ class SparklineWidget(QWidget):
                         QPointF(to_x(i + 1), to_y(v2)),
                     )
 
+        # -- Draw legend (top-right) --
+        self._draw_legend(painter, line_color)
+
         painter.end()
+
+    def _draw_legend(self, painter: QPainter, price_color: QColor):
+        """Draw a small legend box at the top-right corner."""
+        w = self.width()
+        items = [
+            ("K线", price_color, Qt.PenStyle.SolidLine),
+            ("MA5", QColor(ACCENT_BLUE), Qt.PenStyle.DashLine),
+            ("MA10", QColor(255, 152, 0), Qt.PenStyle.DotLine),
+        ]
+
+        font = painter.font()
+        font.setPixelSize(8)
+        painter.setFont(font)
+
+        # Measure sizes
+        sample_w = 10
+        gap = 3
+        item_extents = []
+        total_w = 0
+        for label, _, _ in items:
+            tw = painter.fontMetrics().horizontalAdvance(label)
+            item_extents.append(tw)
+            total_w += sample_w + gap + tw + gap * 3
+        total_w -= gap * 3  # remove trailing spacing
+
+        box_h = 14
+        box_x = w - total_w - 10
+        box_y = 4
+
+        # Semi-transparent background
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 80))
+        painter.drawRoundedRect(
+            QRectF(box_x - 4, box_y - 1, total_w + 8, box_h + 2), 3, 3
+        )
+
+        # Draw each legend item
+        x = box_x
+        for (label, color, style), tw in zip(items, item_extents):
+            # Sample line
+            line_y = box_y + box_h // 2
+            pen = QPen(color)
+            pen.setWidth(1.5)
+            pen.setStyle(style)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(x, line_y), QPointF(x + sample_w, line_y))
+
+            # Label
+            painter.setPen(QColor(TEXT_SECONDARY))
+            painter.drawText(
+                QPointF(x + sample_w + gap, box_y + box_h - 3), label
+            )
+            x += sample_w + gap + tw + gap * 3

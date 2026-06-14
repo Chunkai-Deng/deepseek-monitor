@@ -95,6 +95,18 @@ class StockCardWidget(QFrame):
         mr_row.addStretch()
         layout.addLayout(mr_row)
 
+        # ADX row
+        adx_row = QHBoxLayout()
+        adx_row.setSpacing(10)
+        self._lbl_adx = self._make_indicator_pair("ADX")
+        self._lbl_pdi = self._make_indicator_pair("+DI")
+        self._lbl_mdi = self._make_indicator_pair("-DI")
+        adx_row.addLayout(self._lbl_adx)
+        adx_row.addLayout(self._lbl_pdi)
+        adx_row.addLayout(self._lbl_mdi)
+        adx_row.addStretch()
+        layout.addLayout(adx_row)
+
         # KDJ row
         kdj_row = QHBoxLayout()
         kdj_row.setSpacing(10)
@@ -193,6 +205,22 @@ class StockCardWidget(QFrame):
                 rsi_text = f"{rsi_val:.1f} 中性"
                 rsi_color = GRAY
             self._set_indicator_color(self._lbl_rsi, rsi_text, rsi_color)
+
+        # ADX
+        if data.adx is not None:
+            self._set_indicator(self._lbl_adx, data.adx, fmt=".1f")
+            adx_val = data.adx
+            if adx_val > 40:
+                self._set_indicator_color(
+                    self._lbl_adx, f"{adx_val:.1f} 强", RED if data.plus_di and data.plus_di > data.minus_di else GREEN
+                )
+            elif adx_val > 20:
+                self._set_indicator_color(self._lbl_adx, f"{adx_val:.1f} 中", GRAY)
+            else:
+                self._set_indicator_color(self._lbl_adx, f"{adx_val:.1f} 弱", GRAY)
+        if data.plus_di is not None and data.minus_di is not None:
+            self._set_indicator_color(self._lbl_pdi, f"{data.plus_di:.1f}", RED)
+            self._set_indicator_color(self._lbl_mdi, f"{data.minus_di:.1f}", GREEN)
 
         # KDJ
         if data.k is not None and data.d is not None and data.j is not None:
@@ -315,6 +343,28 @@ class StockCardWidget(QFrame):
                 score += 1
                 notes.append("KDJ在低位区，超跌反弹可期")
 
+        # ---- ADX ----
+        if data.adx is not None:
+            if data.adx > 40:
+                if data.plus_di and data.minus_di and data.plus_di > data.minus_di:
+                    notes.append("ADX显示强势上涨，顺势而为")
+                    score += 1
+                else:
+                    notes.append("ADX显示强势下跌，不要逆势")
+                    score -= 1
+            elif data.adx > 20:
+                notes.append("趋势正在形成中，方向开始明朗")
+            else:
+                notes.append("ADX偏低，行情偏震荡，指标信号参考价值有限")
+
+        # ---- Divergence ----
+        if data.divergence == "顶背离":
+            score -= 2
+            notes.append("顶背离！股价新高但MACD/RSI没跟上，大概率要回调")
+        elif data.divergence == "底背离":
+            score += 2
+            notes.append("底背离！股价新低但指标拒绝跟随，反转机会来了")
+
         # ---- Weekly trend ----
         if data.weekly_trend == "上涨":
             score += 1
@@ -332,20 +382,21 @@ class StockCardWidget(QFrame):
             if dist_to_resist < 3:
                 notes.append(f"离压力位不远（{dist_to_resist:.1f}%），突破才能看高")
 
-        # ---- Overall ----
-        if score >= 4:
-            overall, color = "走势较强，可持有或逢低加仓 ↑", RED
-        elif score >= 1:
-            overall, color = "震荡偏多，可以继续拿着看看 ↑", RED
-        elif score <= -4:
-            overall, color = "走势较弱，建议观望或减仓 ↓", GREEN
-        elif score <= -1:
-            overall, color = "震荡偏弱，等等再说 ↓", GREEN
-        else:
-            overall, color = "方向不明朗，多看少动 ↔", GRAY
-
+        # ---- Build trading signal ----
         detail = "；".join(notes) if notes else "数据不够，再等一等"
-        return f"{overall}\n{detail}", color, score
+
+        signal, action, color = _trading_signal(
+            score=score,
+            divergence=data.divergence,
+            price=data.price,
+            support=data.support,
+            resistance=data.resistance,
+            rsi=data.rsi,
+            j=data.j,
+            adx=data.adx,
+            vol_trend=data.vol_trend,
+        )
+        return f"{signal}\n{action}\n{detail}", color, score
 
     # -- Indicator helpers --
 
@@ -380,3 +431,102 @@ class StockCardWidget(QFrame):
             row._value_label.setStyleSheet(
                 f"font-size: 10px; font-weight: bold; color: {color};"
             )
+
+
+def _trading_signal(
+    *,
+    score: int,
+    divergence: str,
+    price: float,
+    support: float | None,
+    resistance: float | None,
+    rsi: float | None,
+    j: float | None,
+    adx: float | None,
+    vol_trend: str,
+) -> tuple[str, str, str]:
+    """Build a trading signal with price targets. Returns (signal, action, color)."""
+
+    # -- Price targets --
+    targets: list[str] = []
+    if support and resistance and price:
+        upside = (resistance - price) / price * 100
+        downside = (price - support) / price * 100
+
+        # Buy zone: near support
+        buy_zone = support * 1.02
+        # Sell zone: near resistance
+        sell_zone = resistance * 0.98
+        # Stop loss below support
+        stop_loss = support * 0.97
+
+        targets.append(f"支撑位 ¥{support:.2f}（距现价 {downside:.1f}%）")
+        targets.append(f"压力位 ¥{resistance:.2f}（距现价 {upside:.1f}%）")
+
+    # -- Determine signal --
+    if divergence == "顶背离" and score <= -1:
+        signal = "⚠️ 卖出信号 — 顶背离"
+        action_lines = ["顶背离是强烈的见顶信号，建议减仓或清仓止盈"]
+        if resistance:
+            action_lines.append(f"压力位 ¥{resistance:.2f}，难突破建议先出")
+        color = GREEN
+    elif divergence == "底背离" and score >= 0:
+        signal = "🔥 买入信号 — 底背离"
+        action_lines = ["底背离通常预示反转，可考虑分批建仓"]
+        if support:
+            buy_price = support * 1.02
+            stop = support * 0.97
+            action_lines.append(f"建议买入价 ¥{buy_price:.2f}，止损 ¥{stop:.2f}")
+        color = RED
+    elif score >= 5:
+        signal = "📈 强烈看涨，持仓待涨"
+        action_lines = ["指标全面偏多，可继续持有"]
+        if resistance:
+            action_lines.append(f"第一目标位 ¥{resistance:.2f}，到位可部分止盈")
+        if support:
+            action_lines.append(f"止损上移至 ¥{support * 1.02:.2f}")
+        color = RED
+    elif score >= 3:
+        signal = "📈 偏多，逢低可加仓"
+        action_lines = ["趋势向好但不宜追高"]
+        if support:
+            action_lines.append(f"等回调到支撑 ¥{support:.2f} 附近再加仓更稳妥")
+        if resistance:
+            action_lines.append(f"上方压力 ¥{resistance:.2f}，注意止盈节奏")
+        color = RED
+    elif score >= 1:
+        signal = "📊 震荡偏多，持有观望"
+        action_lines = ["短期方向不明显，已经有了可以先不动"]
+        if adx and adx < 20:
+            action_lines.append("ADX偏低，震荡市不要频繁操作")
+        color = RED
+    elif score <= -5:
+        signal = "📉 强烈看跌，建议清仓"
+        action_lines = ["指标全面偏空，持币观望更安全"]
+        if support:
+            action_lines.append(f"下方支撑 ¥{support:.2f}，跌破要看更低")
+        color = GREEN
+    elif score <= -3:
+        signal = "📉 偏空，减仓或止盈"
+        action_lines = ["走势偏弱，仓位重的建议减一部分"]
+        if resistance:
+            action_lines.append(f"反弹到 ¥{resistance:.2f} 附近是减仓机会")
+        color = GREEN
+    elif score <= -1:
+        signal = "📊 震荡偏弱，多看少动"
+        action_lines = ["方向偏弱但不算极端，有持仓可减，没持仓先等等"]
+        if adx and adx < 20:
+            action_lines.append("趋势不强，不要急着抄底")
+        color = GREEN
+    else:
+        signal = "📊 观望 — 等信号明确"
+        action_lines = ["目前多空力量均衡，没有明确方向"]
+        if vol_trend == "缩量":
+            action_lines.append("缩量震荡，变盘在即，等放量再动手")
+        else:
+            action_lines.append("等趋势明朗后再做决定")
+        color = GRAY
+
+    # -- Append price targets --
+    action_lines.append(" | ".join(targets))
+    return signal, "\n".join(action_lines), color

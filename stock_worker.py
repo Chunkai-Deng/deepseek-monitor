@@ -94,6 +94,14 @@ class StockData:
     d: float | None = None
     j: float | None = None
 
+    # ADX (trend strength)
+    adx: float | None = None
+    plus_di: float | None = None
+    minus_di: float | None = None
+
+    # Divergence detection
+    divergence: str = ""   # "顶背离", "底背离", ""
+
     # Weekly trend
     weekly_change_pct: float | None = None
     weekly_trend: str = ""                # "上涨"/"下跌"
@@ -306,6 +314,12 @@ class StockWorker(QThread):
             d_val = d_vals[-1] if d_vals else None
             j_val = j_vals[-1] if j_vals else None
 
+            # -- ADX (14) --
+            adx_val, plus_di, minus_di = self._compute_adx(high, low, close)
+
+            # -- Divergence --
+            div_text = self._detect_divergence(close, rsi_s, macd_s)
+
             return {
                 "closes": closes_list,
                 "ma5": ma5_list,
@@ -328,6 +342,10 @@ class StockWorker(QThread):
                 "k": k_val,
                 "d": d_val,
                 "j": j_val,
+                "adx": adx_val,
+                "plus_di": plus_di,
+                "minus_di": minus_di,
+                "divergence": div_text,
             }
 
         except Exception as e:
@@ -369,3 +387,141 @@ class StockWorker(QThread):
         except Exception:
             logger.debug("Weekly K-line fetch failed", exc_info=True)
         return {"weekly_change_pct": None, "weekly_trend": ""}
+
+    # ----------------------------------------------------------
+    #  ADX (Average Directional Index)
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _compute_adx(high, low, close, period: int = 14):
+        """Compute ADX, +DI, -DI using Wilder's smoothing."""
+        try:
+            h = high.values if hasattr(high, 'values') else high
+            l = low.values if hasattr(low, 'values') else low
+            c = close.values if hasattr(close, 'values') else close
+        except Exception:
+            return None, None, None
+
+        if len(h) < period + 2:
+            return None, None, None
+
+        # True Range
+        tr = np.maximum(
+            h[1:] - l[1:],
+            np.maximum(
+                np.abs(h[1:] - c[:-1]),
+                np.abs(l[1:] - c[:-1]),
+            ),
+        )
+
+        # Directional Movement
+        up_move = h[1:] - h[:-1]
+        down_move = l[:-1] - l[1:]
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+        # Wilder's smoothing (equivalent to EMA with alpha = 1/period)
+        alpha = 1.0 / period
+        atr = np.zeros_like(tr); atr[0] = tr[0]
+        pdi_raw = np.zeros_like(tr); pdi_raw[0] = plus_dm[0]
+        mdi_raw = np.zeros_like(tr); mdi_raw[0] = minus_dm[0]
+
+        for i in range(1, len(tr)):
+            atr[i] = atr[i-1] * (1 - alpha) + tr[i] * alpha
+            pdi_raw[i] = pdi_raw[i-1] * (1 - alpha) + plus_dm[i] * alpha
+            mdi_raw[i] = mdi_raw[i-1] * (1 - alpha) + minus_dm[i] * alpha
+
+        plus_di = np.where(atr > 0, 100 * pdi_raw / atr, 0.0)
+        minus_di = np.where(atr > 0, 100 * mdi_raw / atr, 0.0)
+        denom = plus_di + minus_di
+        dx = np.zeros_like(plus_di)
+        mask = denom > 0
+        dx[mask] = 100 * np.abs(plus_di[mask] - minus_di[mask]) / denom[mask]
+
+        # Smooth DX to get ADX
+        adx = np.zeros_like(dx); adx[0] = dx[0]
+        for i in range(1, len(dx)):
+            adx[i] = adx[i-1] * (1 - alpha) + dx[i] * alpha
+
+        last_adx = float(adx[-1]) if not np.isnan(adx[-1]) else None
+        last_pdi = float(plus_di[-1]) if not np.isnan(plus_di[-1]) else None
+        last_mdi = float(minus_di[-1]) if not np.isnan(minus_di[-1]) else None
+        return last_adx, last_pdi, last_mdi
+
+    # ----------------------------------------------------------
+    #  Divergence detection
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _detect_divergence(close, rsi_s, macd_s, window: int = 5):
+        """Detect RSI/MACD divergence against price."""
+        try:
+            c = close.values if hasattr(close, 'values') else close
+            r = rsi_s.values if hasattr(rsi_s, 'values') else rsi_s
+            m = macd_s.values if hasattr(macd_s, 'values') else macd_s
+        except Exception:
+            return ""
+
+        valid = np.isfinite(c) & np.isfinite(r) & np.isfinite(m)
+        c, r, m = c[valid], r[valid], m[valid]
+        if len(c) < 20:
+            return ""
+
+        # Find local peaks in the last 30 bars
+        tail = min(30, len(c))
+        c_tail = c[-tail:]
+        r_tail = r[-tail:]
+        m_tail = m[-tail:]
+
+        peaks, troughs = _find_swings(c_tail, window)
+        _, r_peaks = _find_swings(r_tail, window)
+        r_troughs = []
+        # RSI troughs: invert and find peaks
+        r_inv = -r_tail
+        _, r_troughs = _find_swings(r_inv, window)
+
+        _, m_peaks = _find_swings(m_tail, window)
+        m_inv = -m_tail
+        _, m_troughs = _find_swings(m_inv, window)
+
+        # Top divergence: price higher high, RSI/MACD lower high
+        if len(peaks) >= 2:
+            i1, i2 = peaks[-2], peaks[-1]
+            if c_tail[i2] > c_tail[i1]:
+                rsi_div = any(abs(p - i2) <= 2 for p in r_peaks) and \
+                    any(abs(p - i1) <= 2 for p in r_peaks) and \
+                    r_tail[i2] < r_tail[i1]
+                macd_div = any(abs(p - i2) <= 2 for p in m_peaks) and \
+                    any(abs(p - i1) <= 2 for p in m_peaks) and \
+                    m_tail[i2] < m_tail[i1]
+                if rsi_div or macd_div:
+                    return "顶背离"
+
+        # Bottom divergence: price lower low, RSI/MACD higher low
+        if len(troughs) >= 2:
+            i1, i2 = troughs[-2], troughs[-1]
+            if c_tail[i2] < c_tail[i1]:
+                rsi_div = any(abs(t - i2) <= 2 for t in r_troughs) and \
+                    any(abs(t - i1) <= 2 for t in r_troughs) and \
+                    r_tail[i2] > r_tail[i1]
+                macd_div = any(abs(t - i2) <= 2 for t in m_troughs) and \
+                    any(abs(t - i1) <= 2 for t in m_troughs) and \
+                    m_tail[i2] > m_tail[i1]
+                if rsi_div or macd_div:
+                    return "底背离"
+
+        return ""
+
+
+def _find_swings(data, window: int = 5):
+    """Find local peaks and troughs in a 1-d array."""
+    peaks = []
+    troughs = []
+    for i in range(window, len(data) - window):
+        left = data[i - window:i]
+        right = data[i + 1:i + window + 1]
+        if data[i] >= max(left) and data[i] > max(right):
+            peaks.append(i)
+        if data[i] <= min(left) and data[i] < min(right):
+            troughs.append(i)
+    return peaks, troughs
